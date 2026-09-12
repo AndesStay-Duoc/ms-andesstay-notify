@@ -1,0 +1,30 @@
+# --- Maven / Java ---
+target/
+!.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+*.log
+hs_err_pid*
+
+# --- Entorno y secretos: NUNCA versionar ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+application-local.yml
+
+# --- Editores ---
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+
+# --- Sistema operativo ---
+.DS_Store
+Thumbs.db
