@@ -1,0 +1,44 @@
+server:
+  port: 8085
+
+spring:
+  application:
+    name: ms-andesstay-notify
+
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USER:}
+    password: ${RABBITMQ_PASS:}
+    virtual-host: andesstay
+    listener:
+      simple:
+        acknowledge-mode: manual
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 2000
+          multiplier: 2
+
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USER:}
+    password: ${MAIL_PASS:}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+
+andesstay:
+  rabbitmq:
+    queues:
+      email: q.cmd.email
+      housekeeping: q.cmd.housekeeping
+      voucher: q.cmd.voucher
+    dlx: cmd.dead.dlx
+  mail:
+    from: "AndesStay <noreply@andesstay.cl>"
+
+logging:
+  level:
+    cl.andesstay: DEBUG
