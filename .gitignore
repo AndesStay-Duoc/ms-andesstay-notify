@@ -28,3 +28,9 @@ application-local.yml
 # --- Sistema operativo ---
 .DS_Store
 Thumbs.db
+
+# --- Configuracion local adicional ---
+*.env
+application-local.properties
+application-local.yaml
+HELP.md
