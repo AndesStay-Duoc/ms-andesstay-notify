@@ -1,52 +1,69 @@
 package cl.andesstay.notify.consumer;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.rabbitmq.client.Channel;
+import cl.andesstay.notify.messaging.Envelope;
+import cl.andesstay.notify.messaging.EnvelopeReader;
+import cl.andesstay.notify.support.ProcesamientoIdempotente;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 
-import java.io.IOException;
-import java.util.Map;
+import java.util.Set;
 
+/**
+ * Consume q.cmd.voucher y genera el comprobante de la reserva.
+ *
+ * Es el mensaje que resuelve el problema de que el huésped no recibía comprobante formal.
+ *
+ * Sobre el manejo de errores y el modo de acknowledge, ver la explicación en
+ * {@link EmailConsumer}.
+ */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class VoucherConsumer {
 
-    private final ObjectMapper objectMapper;
+    private static final String COLA = "q.cmd.voucher";
 
-    /**
-     * Consume mensajes de la cola q.cmd.voucher.
-     * Genera un voucher PDF con los datos de la reserva y lo envía al huésped.
-     * En producción se utilizaría una librería como iText o JasperReports.
-     */
-    @RabbitListener(queues = "${andesstay.rabbitmq.queues.voucher}", ackMode = "MANUAL")
-    public void processVoucher(Message message, Channel channel) throws IOException {
-        long deliveryTag = message.getMessageProperties().getDeliveryTag();
-        String traceId = "(sin traceId)";
-        try {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> envelope = objectMapper.readValue(message.getBody(), Map.class);
-            traceId = (String) envelope.getOrDefault("traceId", traceId);
+    private static final Set<String> DOCUMENTOS = Set.of("VOUCHER", "BOLETA");
 
-            @SuppressWarnings("unchecked")
-            Map<String, Object> payload = (Map<String, Object>) envelope.get("payload");
-            Object reservationId = payload.get("reservationId");
-            String guestEmail    = (String) payload.get("guestEmail");
+    private final EnvelopeReader envelopeReader;
+    private final ProcesamientoIdempotente procesamiento;
 
-            log.info("[Voucher] Generando voucher reserva={} para={} traceId={}",
-                    reservationId, guestEmail, traceId);
+    @RabbitListener(queues = "${andesstay.rabbitmq.queues.voucher}")
+    public void processVoucher(Message message) {
+        Envelope envelope = envelopeReader.leer(message);
+        String traceId = envelope.traceIdODesconocido();
 
-            // TODO: Generar PDF con iText/JasperReports y adjuntarlo al email
-            log.info("[Voucher] Voucher generado y enviado a {} (simulado)", guestEmail);
+        procesamiento.ejecutar(COLA, envelope.eventId(), traceId, () -> generar(envelope, traceId));
+    }
 
-            channel.basicAck(deliveryTag, false);
-        } catch (Exception e) {
-            log.error("[Voucher] Error generando voucher traceId={}: {}", traceId, e.getMessage());
-            channel.basicNack(deliveryTag, false, false);
+    private void generar(Envelope envelope, String traceId) {
+        Object reservationId = envelope.valor("reservationId");
+        // El formato contratado usa destinatario/tipoDocumento; el anterior usaba guestEmail y no
+        // traía tipo de documento, de ahí el VOUCHER por omisión.
+        String destinatario = envelope.texto("destinatario", "guestEmail");
+        String tipoDocumento = envelope.texto("tipoDocumento");
+        if (tipoDocumento == null) {
+            tipoDocumento = "VOUCHER";
         }
+
+        if (reservationId == null) {
+            throw new AmqpRejectAndDontRequeueException("el payload no trae reservationId");
+        }
+        if (destinatario == null) {
+            throw new AmqpRejectAndDontRequeueException("el payload no trae destinatario");
+        }
+        if (!DOCUMENTOS.contains(tipoDocumento)) {
+            throw new AmqpRejectAndDontRequeueException(
+                    "tipoDocumento desconocido: " + tipoDocumento + " (conocidos: " + DOCUMENTOS + ")");
+        }
+
+        // TODO: generar el PDF con iText o JasperReports y adjuntarlo al correo. Hasta entonces el
+        // documento queda registrado con sus datos, que es lo que consume la evidencia de la fase 6.
+        log.info("[Voucher] {} generado reserva={} destinatario={} datos={} traceId={}",
+                tipoDocumento, reservationId, destinatario, envelope.datos(), traceId);
     }
 }
