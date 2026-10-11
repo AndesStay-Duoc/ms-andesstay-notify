@@ -9,16 +9,38 @@ spring:
     host: ${RABBITMQ_HOST:localhost}
     port: ${RABBITMQ_PORT:5672}
     username: ${RABBITMQ_USER:}
+    # El nombre de la variable es RABBITMQ_PASS dentro del contenedor, y el compose lo mapea desde
+    # RABBITMQ_PASSWORD del .env. Cambiar uno sin el otro deja la contraseña vacía y el broker
+    # responde ACCESS_REFUSED.
     password: ${RABBITMQ_PASS:}
-    virtual-host: andesstay
+    virtual-host: ${RABBITMQ_VHOST:andesstay}
     listener:
       simple:
-        acknowledge-mode: manual
+        # NO se declara acknowledge-mode: el valor por omisión es AUTO, que es el que se quiere.
+        #
+        # Con AUTO el contenedor confirma al retornar sin error y rechaza al propagarse la
+        # excepción. Con MANUAL, que es lo que había antes, el contenedor no envía ack ni nack por
+        # su cuenta: una excepción dejaría el mensaje sin confirmar hasta el cierre del canal y
+        # entonces se reencolaría en lugar de ir a la DLQ.
+        #
+        # El AUTO de Spring no es el auto-ack del protocolo AMQP, que es NONE y sí pierde mensajes
+        # si el consumidor muere. AUTO emite un basic.ack real.
+
+        # Fair dispatch. Con tres intentos y multiplicador 2 el hilo duerme hasta 6 s por mensaje;
+        # sin esto, un solo consumidor retendría la ventana por omisión de 250 mensajes sin
+        # confirmar.
+        prefetch: ${NOTIFY_PREFETCH:1}
+
+        # Red de seguridad: si algún día se desactivara el retry, un rechazo seguiría sin reencolar
+        # y acabaría en la DLQ en lugar de entrar en un bucle de reentrega.
+        default-requeue-rejected: false
+
         retry:
           enabled: true
-          max-attempts: 3
-          initial-interval: 2000
-          multiplier: 2
+          max-attempts: ${NOTIFY_MAX_ATTEMPTS:3}
+          initial-interval: ${NOTIFY_BACKOFF_MS:1000}
+          max-interval: ${NOTIFY_BACKOFF_MAX_MS:10000}
+          multiplier: 2.0
 
   mail:
     host: ${MAIL_HOST:smtp.gmail.com}
@@ -31,13 +53,63 @@ spring:
 
 andesstay:
   rabbitmq:
+    # Topología del caso: tres exchanges, seis colas y nueve bindings. Se declara en código, en
+    # config/RabbitMQConfig.java; estos valores son la única fuente de los nombres.
+    exchange:
+      direct: cmd.direct
+      topic: cmd.topic
+      dlx: cmd.dead.dlx
     queues:
       email: q.cmd.email
+      email-dlq: q.cmd.email.dlq
       housekeeping: q.cmd.housekeeping
+      housekeeping-dlq: q.cmd.housekeeping.dlq
       voucher: q.cmd.voucher
-    dlx: cmd.dead.dlx
+      voucher-dlq: q.cmd.voucher.dlq
+    routing:
+      email-send: email.send
+      email-topic: "email.*"
+      email-dead: email.dead
+      housekeeping-ticket: housekeeping.ticket
+      housekeeping-topic: "housekeeping.#"
+      housekeeping-dead: housekeeping.dead
+      voucher-gen: voucher.gen
+      voucher-topic: "voucher.*"
+      voucher-dead: voucher.dead
+    retencion:
+      # Políticas de retención de la guía 2.2.3. Una notificación de hace más de cinco minutos ya
+      # no le sirve al huésped, así que expira y queda registrada en la DLQ en lugar de llegar
+      # tarde.
+      mensaje-ttl-ms: ${NOTIFY_MENSAJE_TTL_MS:300000}
+      # Veinticuatro horas de histórico en la DLQ, para poder analizar el fallo.
+      dlq-ttl-ms: ${NOTIFY_DLQ_TTL_MS:86400000}
+      max-length: ${NOTIFY_MAX_LENGTH:1000}
+
+  notify:
+    idempotencia:
+      # El registro vive en memoria porque este servicio no tiene base de datos. Ver
+      # support/ProcessedEventCache.java.
+      ttl: ${NOTIFY_IDEMPOTENCIA_TTL:PT6H}
+      capacidad-maxima: ${NOTIFY_IDEMPOTENCIA_CAPACIDAD:50000}
+
   mail:
-    from: "AndesStay <noreply@andesstay.cl>"
+    from: ${MAIL_FROM:AndesStay <noreply@andesstay.cl>}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # metrics es lo que habilita notify.messages.* y notify.dlq.rate, que es el ítem 6.9 del
+        # checklist.
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+  health:
+    rabbit:
+      # Aquí sí tiene sentido, al contrario que en reservations: si notify no alcanza el broker, no
+      # sirve para nada y el contenedor debe quedar unhealthy.
+      enabled: true
 
 logging:
   level:

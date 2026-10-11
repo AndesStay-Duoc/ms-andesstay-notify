@@ -1,55 +1,69 @@
 package cl.andesstay.notify.consumer;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.rabbitmq.client.Channel;
+import cl.andesstay.notify.messaging.Envelope;
+import cl.andesstay.notify.messaging.EnvelopeReader;
+import cl.andesstay.notify.support.ProcesamientoIdempotente;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 
-import java.io.IOException;
-import java.util.Map;
+import java.util.Set;
 
+/**
+ * Consume q.cmd.housekeeping y emite el ticket de preparación o de limpieza de la unidad.
+ *
+ * Es el mensaje que resuelve el problema de que housekeeping se enteraba tarde.
+ *
+ * Sobre el manejo de errores y el modo de acknowledge, ver la explicación en
+ * {@link EmailConsumer}: el método no captura excepciones, para que la política de reintentos
+ * tenga efecto, y el modo AUTO es el que convierte un fallo agotado en un viaje a la DLQ.
+ */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class HousekeepingConsumer {
 
-    private final ObjectMapper objectMapper;
+    private static final String COLA = "q.cmd.housekeeping";
 
-    /**
-     * Consume mensajes de la cola q.cmd.housekeeping.
-     * En un sistema real aquí se enviaría una notificación push al equipo de housekeeping
-     * o se crearía un ticket en el sistema de gestión del hostal.
-     */
-    @RabbitListener(queues = "${andesstay.rabbitmq.queues.housekeeping}", ackMode = "MANUAL")
-    public void processHousekeeping(Message message, Channel channel) throws IOException {
-        long deliveryTag = message.getMessageProperties().getDeliveryTag();
-        String traceId = "(sin traceId)";
-        try {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> envelope = objectMapper.readValue(message.getBody(), Map.class);
-            traceId = (String) envelope.getOrDefault("traceId", traceId);
+    /** PREPARACION al pasar a CHECKIN_PENDIENTE, LIMPIEZA al pasar a CHECKOUT. */
+    private static final Set<String> TAREAS = Set.of("PREPARACION", "LIMPIEZA", "PREPARE", "CLEAN");
 
-            @SuppressWarnings("unchecked")
-            Map<String, Object> payload = (Map<String, Object>) envelope.get("payload");
-            Object unitId = payload.get("unitId");
-            String date   = (String) payload.get("date");
-            String action = (String) payload.get("action");  // PREPARE | CLEAN
+    private final EnvelopeReader envelopeReader;
+    private final ProcesamientoIdempotente procesamiento;
 
-            log.info("[Housekeeping] Ticket generado → unitId={} fecha={} acción={} traceId={}",
-                    unitId, date, action, traceId);
+    @RabbitListener(queues = "${andesstay.rabbitmq.queues.housekeeping}")
+    public void processHousekeeping(Message message) {
+        Envelope envelope = envelopeReader.leer(message);
+        String traceId = envelope.traceIdODesconocido();
 
-            // TODO: Integrar con sistema de tickets del hostal o enviar push a staff
-            // Por ahora loguea el ticket con todos sus datos
-            log.info("[Housekeeping] TICKET: unidad={} debe ser {} para el {}",
-                    unitId, action.equals("PREPARE") ? "preparada" : "limpiada", date);
+        procesamiento.ejecutar(COLA, envelope.eventId(), traceId, () -> emitirTicket(envelope, traceId));
+    }
 
-            channel.basicAck(deliveryTag, false);
-        } catch (Exception e) {
-            log.error("[Housekeeping] Error procesando ticket traceId={}: {}", traceId, e.getMessage());
-            channel.basicNack(deliveryTag, false, false);
+    private void emitirTicket(Envelope envelope, String traceId) {
+        // El formato contratado usa tipoTarea/fechaRequerida; el anterior usaba action/date.
+        String tipoTarea = envelope.texto("tipoTarea", "action");
+        String fecha = envelope.texto("fechaRequerida", "date");
+        Object unitId = envelope.valor("unitId");
+        Object reservationId = envelope.valor("reservationId");
+        String unidad = envelope.texto("unidad");
+        String prioridad = envelope.texto("prioridad");
+        String notas = envelope.texto("notas");
+
+        if (tipoTarea == null || !TAREAS.contains(tipoTarea)) {
+            throw new AmqpRejectAndDontRequeueException(
+                    "tipoTarea desconocido: " + tipoTarea + " (conocidos: " + TAREAS + ")");
         }
+        if (unitId == null) {
+            throw new AmqpRejectAndDontRequeueException("el payload no trae unitId");
+        }
+
+        // TODO: integrar con el sistema de tickets del hostal o enviar push al equipo. Hasta
+        // entonces el ticket queda en el log con todos sus datos, que es lo que consume la
+        // evidencia de la fase 6.
+        log.info("[Housekeeping] TICKET {} → unitId={} unidad={} reserva={} fecha={} prioridad={} notas={} traceId={}",
+                tipoTarea, unitId, unidad, reservationId, fecha, prioridad, notas, traceId);
     }
 }
