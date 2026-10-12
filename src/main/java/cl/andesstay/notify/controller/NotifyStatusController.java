@@ -12,13 +12,20 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
 /**
- * Estado del flujo de colas: profundidad de las seis colas, tasa de DLQ y tamaño del registro de
+ * Estado del flujo de colas: profundidad de las nueve colas, tasa de DLQ y tamaño del registro de
  * idempotencia. Es el equivalente del endpoint de estado que expone la guía 2.2.3.
+ *
+ * Las colas se agrupan por flujo y no en una lista plana, porque el conteo importa: tres flujos con
+ * tres colas cada uno se lee como un patrón repetido, mientras que nueve nombres sueltos invitan a
+ * preguntar por qué no son seis.
+ *
+ * La profundidad de las colas de espera es una medida que el rediseño hizo posible: mensajes con
+ * reintento pendiente AHORA MISMO. Con el reintento en proceso de Spring Retry no existía, porque
+ * la espera vivía en un hilo dormido y no en el broker.
  *
  * Deliberadamente NO se publica en el API Gateway. ms-andesstay-notify no tiene starter de
  * security, así que su superficie HTTP solo debe ser alcanzable desde dentro de la instancia: el
@@ -44,33 +51,54 @@ public class NotifyStatusController {
 
     @Value("${andesstay.rabbitmq.queues.email}")
     private String colaEmail;
+    @Value("${andesstay.rabbitmq.queues.email-retry}")
+    private String esperaEmail;
     @Value("${andesstay.rabbitmq.queues.email-dlq}")
     private String dlqEmail;
+
     @Value("${andesstay.rabbitmq.queues.housekeeping}")
     private String colaHousekeeping;
+    @Value("${andesstay.rabbitmq.queues.housekeeping-retry}")
+    private String esperaHousekeeping;
     @Value("${andesstay.rabbitmq.queues.housekeeping-dlq}")
     private String dlqHousekeeping;
+
     @Value("${andesstay.rabbitmq.queues.voucher}")
     private String colaVoucher;
+    @Value("${andesstay.rabbitmq.queues.voucher-retry}")
+    private String esperaVoucher;
     @Value("${andesstay.rabbitmq.queues.voucher-dlq}")
     private String dlqVoucher;
 
     @GetMapping("/status")
     public Map<String, Object> estado() {
-        Map<String, Object> colas = new LinkedHashMap<>();
-        for (String nombre : List.of(colaEmail, dlqEmail,
-                colaHousekeeping, dlqHousekeeping,
-                colaVoucher, dlqVoucher)) {
-            colas.put(nombre, describir(nombre));
-        }
+        Map<String, Object> flujos = new LinkedHashMap<>();
+        flujos.put("email", describirFlujo(colaEmail, esperaEmail, dlqEmail));
+        flujos.put("housekeeping", describirFlujo(colaHousekeeping, esperaHousekeeping, dlqHousekeeping));
+        flujos.put("voucher", describirFlujo(colaVoucher, esperaVoucher, dlqVoucher));
 
         Map<String, Object> respuesta = new LinkedHashMap<>();
         respuesta.put("servicio", "ms-andesstay-notify");
         respuesta.put("timestamp", Instant.now().toString());
-        respuesta.put("colas", colas);
+        respuesta.put("flujos", flujos);
         respuesta.put("tasaDlq", metrics.tasaDlq());
         respuesta.put("eventIdEnRegistro", procesados.tamano());
         return respuesta;
+    }
+
+    /**
+     * Las tres colas de un flujo, con el papel de cada una explícito en la clave.
+     *
+     * "espera" y no "retry" porque es lo que la cola hace: el mensaje aguarda ahí su siguiente
+     * intento y nadie la consume. Un valor distinto de cero significa reintentos en curso en este
+     * instante.
+     */
+    private Map<String, Object> describirFlujo(String trabajo, String espera, String dlq) {
+        Map<String, Object> flujo = new LinkedHashMap<>();
+        flujo.put("trabajo", Map.of(trabajo, describir(trabajo)));
+        flujo.put("espera", Map.of(espera, describir(espera)));
+        flujo.put("cuarentena", Map.of(dlq, describir(dlq)));
+        return flujo;
     }
 
     private Object describir(String nombre) {
