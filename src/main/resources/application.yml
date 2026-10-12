@@ -51,6 +51,18 @@ spring:
       mail.smtp.auth: true
       mail.smtp.starttls.enable: true
 
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Firma (JWKS), vigencia, issuer y audience del JWT de Azure AD
+          issuer-uri: https://login.microsoftonline.com/${AZURE_TENANT_ID:055d11d1-8ae0-4221-a6f7-b50be0a623b4}/v2.0
+          jwk-set-uri: https://login.microsoftonline.com/${AZURE_TENANT_ID:055d11d1-8ae0-4221-a6f7-b50be0a623b4}/discovery/v2.0/keys
+          # Azure AD puede emitir aud como api://<clientId> o como el GUID del clientId
+          audiences:
+            - api://${AZURE_CLIENT_ID:704a544f-3d92-44f5-aef9-8559574cff34}
+            - ${AZURE_CLIENT_ID:704a544f-3d92-44f5-aef9-8559574cff34}
+
 andesstay:
   rabbitmq:
     # Topología del caso: tres exchanges, seis colas y nueve bindings. Se declara en código, en

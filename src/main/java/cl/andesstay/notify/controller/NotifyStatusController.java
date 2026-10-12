@@ -6,6 +6,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.amqp.core.AmqpAdmin;
 import org.springframework.amqp.rabbit.core.RabbitAdmin;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -20,10 +21,11 @@ import java.util.Properties;
  * Estado del flujo de colas: profundidad de las seis colas, tasa de DLQ y tamaño del registro de
  * idempotencia. Es el equivalente del endpoint de estado que expone la guía 2.2.3.
  *
- * Deliberadamente NO se publica en el API Gateway. ms-andesstay-notify no tiene starter de
- * security, así que su superficie HTTP solo debe ser alcanzable desde dentro de la instancia: el
- * puerto 8085 no se abre en el Security Group de ec2-mq. Sirve para la evidencia y para depurar
- * por túnel SSH, no para la aplicación.
+ * Exige un JWT de Azure AD con el rol Admin, como los endpoints de reportería (ver SecurityConfig).
+ *
+ * Además, deliberadamente NO se publica en el API Gateway y el puerto 8085 no se abre en el
+ * Security Group de ec2-mq: sirve para la evidencia y para depurar por túnel SSH, no para la
+ * aplicación.
  */
 @RestController
 @RequestMapping("/api/v1/notify")
@@ -56,6 +58,7 @@ public class NotifyStatusController {
     private String dlqVoucher;
 
     @GetMapping("/status")
+    @PreAuthorize("hasRole('Admin')")
     public Map<String, Object> estado() {
         Map<String, Object> colas = new LinkedHashMap<>();
         for (String nombre : List.of(colaEmail, dlqEmail,
