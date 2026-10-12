@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.Set;
@@ -26,7 +27,9 @@ import java.util.Set;
 @RequiredArgsConstructor
 public class HousekeepingConsumer {
 
-    private static final String COLA = "q.cmd.housekeeping";
+    /** Nombre de la cola, para las métricas y el log: la misma propiedad que usa el listener. */
+    @Value("${andesstay.rabbitmq.queues.housekeeping}")
+    private String cola;
 
     /** PREPARACION al pasar a CHECKIN_PENDIENTE, LIMPIEZA al pasar a CHECKOUT. */
     private static final Set<String> TAREAS = Set.of("PREPARACION", "LIMPIEZA", "PREPARE", "CLEAN");
@@ -39,7 +42,7 @@ public class HousekeepingConsumer {
         Envelope envelope = envelopeReader.leer(message);
         String traceId = envelope.traceIdODesconocido();
 
-        procesamiento.ejecutar(COLA, envelope.eventId(), traceId, () -> emitirTicket(envelope, traceId));
+        procesamiento.ejecutar(cola, envelope.eventId(), traceId, () -> emitirTicket(envelope, traceId));
     }
 
     private void emitirTicket(Envelope envelope, String traceId) {

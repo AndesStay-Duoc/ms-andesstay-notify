@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.Set;
@@ -25,7 +26,9 @@ import java.util.Set;
 @RequiredArgsConstructor
 public class VoucherConsumer {
 
-    private static final String COLA = "q.cmd.voucher";
+    /** Nombre de la cola, para las métricas y el log: la misma propiedad que usa el listener. */
+    @Value("${andesstay.rabbitmq.queues.voucher}")
+    private String cola;
 
     private static final Set<String> DOCUMENTOS = Set.of("VOUCHER", "BOLETA");
 
@@ -37,7 +40,7 @@ public class VoucherConsumer {
         Envelope envelope = envelopeReader.leer(message);
         String traceId = envelope.traceIdODesconocido();
 
-        procesamiento.ejecutar(COLA, envelope.eventId(), traceId, () -> generar(envelope, traceId));
+        procesamiento.ejecutar(cola, envelope.eventId(), traceId, () -> generar(envelope, traceId));
     }
 
     private void generar(Envelope envelope, String traceId) {

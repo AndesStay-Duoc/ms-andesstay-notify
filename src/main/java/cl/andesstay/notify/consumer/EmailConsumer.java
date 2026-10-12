@@ -46,7 +46,9 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class EmailConsumer {
 
-    private static final String COLA = "q.cmd.email";
+    /** Nombre de la cola, para las métricas y el log: la misma propiedad que usa el listener. */
+    @Value("${andesstay.rabbitmq.queues.email}")
+    private String cola;
 
     private final JavaMailSender mailSender;
     private final EnvelopeReader envelopeReader;
@@ -61,7 +63,7 @@ public class EmailConsumer {
         Envelope envelope = envelopeReader.leer(message);
         String traceId = envelope.traceIdODesconocido();
 
-        procesamiento.ejecutar(COLA, envelope.eventId(), traceId, () -> {
+        procesamiento.ejecutar(cola, envelope.eventId(), traceId, () -> {
             String destinatario = direccionValida(envelope);
             EmailTemplates.Correo correo = construir(envelope);
 
