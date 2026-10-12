@@ -1,6 +1,6 @@
 package cl.andesstay.notify.email;
 
-import org.springframework.amqp.AmqpRejectAndDontRequeueException;
+import cl.andesstay.notify.service.SolicitudInvalidaException;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
@@ -29,7 +29,7 @@ public class EmailTemplates {
 
     public Correo render(String plantilla, String reservationId, Map<String, Object> datos) {
         if (plantilla == null || !CONOCIDAS.contains(plantilla)) {
-            throw new AmqpRejectAndDontRequeueException(
+            throw new SolicitudInvalidaException(
                     "plantilla desconocida: " + plantilla + " (conocidas: " + CONOCIDAS + ")");
         }
 
@@ -105,7 +105,7 @@ public class EmailTemplates {
             // El switch es exhaustivo sobre CONOCIDAS y la validación de arriba ya filtró el resto;
             // esta rama solo existe para que agregar una plantilla al Set sin agregar su cuerpo
             // falle de forma explícita en vez de enviar un correo vacío.
-            default -> throw new AmqpRejectAndDontRequeueException(
+            default -> throw new SolicitudInvalidaException(
                     "plantilla declarada pero sin cuerpo: " + plantilla);
         };
     }
