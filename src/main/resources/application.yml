@@ -70,6 +70,32 @@ spring:
       mail.smtp.auth: true
       mail.smtp.starttls.enable: true
 
+      # Los tres plazos del cliente SMTP. Sin declararlos, JavaMail usa -1, que es espera
+      # INDEFINIDA, y eso no es un ajuste fino: rompe el reintento entero.
+      #
+      # Un servidor de correo inalcanzable deja de ser un fallo transitorio y pasa a ser un hilo
+      # bloqueado. Como el consumidor de correo tiene prefetch 1 y una sola concurrencia, el
+      # bloqueo no afecta a un mensaje sino a la cola: q.cmd.email deja de avanzar, los mensajes
+      # se acumulan en estado listo, no se publica nada en la cola de espera, no llega nada a la
+      # DLQ y en el log no aparece ni un error. El único síntoma es una cola que crece, que es
+      # justo el fallo que más tarda en notarse.
+      #
+      # Se midió contra el entorno desplegado deteniendo el servidor de correo: el envío se quedó
+      # bloqueado veinte segundos y terminó CON ÉXITO al volver el servidor, confirmando en el
+      # primer intento un mensaje que debía haber recorrido los cuatro. La escalera de reintentos
+      # era inalcanzable precisamente en el fallo más probable que tiene este servicio.
+      #
+      # Hacen falta los tres y no solo el de conexión: connectiontimeout cubre el establecimiento
+      # del socket, timeout la lectura de la respuesta del servidor y writetimeout la escritura.
+      # Un servidor que acepta la conexión y luego calla se cuela por el segundo, y uno que deja
+      # de leer a mitad del cuerpo, por el tercero.
+      #
+      # Cinco segundos por intento, cuatro intentos y la escalera de esperas suman menos de medio
+      # minuto hasta la DLQ, que es un plazo razonable para una notificación.
+      mail.smtp.connectiontimeout: ${MAIL_TIMEOUT_MS:5000}
+      mail.smtp.timeout: ${MAIL_TIMEOUT_MS:5000}
+      mail.smtp.writetimeout: ${MAIL_TIMEOUT_MS:5000}
+
 andesstay:
   rabbitmq:
     # Topología del caso: tres exchanges, nueve colas y nueve bindings. Se declara en código, en
