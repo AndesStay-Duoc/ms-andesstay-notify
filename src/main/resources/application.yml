@@ -16,31 +16,50 @@ spring:
     virtual-host: ${RABBITMQ_VHOST:andesstay}
     listener:
       simple:
-        # NO se declara acknowledge-mode: el valor por omisión es AUTO, que es el que se quiere.
+        # NO se declara acknowledge-mode, y es deliberado: el modo manual va en el ackMode de cada
+        # @RabbitListener de trabajo, nunca aquí.
         #
-        # Con AUTO el contenedor confirma al retornar sin error y rechaza al propagarse la
-        # excepción. Con MANUAL, que es lo que había antes, el contenedor no envía ack ni nack por
-        # su cuenta: una excepción dejaría el mensaje sin confirmar hasta el cierre del canal y
-        # entonces se reencolaría en lugar de ir a la DLQ.
+        # Puesto aquí sería GLOBAL, y alcanzaría también a los tres listeners de
+        # DeadLetterConsumer, que solo registran y no confirman nada por su cuenta. Las tres DLQ
+        # acumularían mensajes en estado unacked para siempre, y al cerrarse el canal se
+        # reencolarían, con lo que DeadLetterConsumer los volvería a registrar e incrementaría
+        # notify.messages.dlq en bucle: la métrica que es el indicador de salud del sistema se
+        # convertiría en un generador de ruido.
         #
-        # El AUTO de Spring no es el auto-ack del protocolo AMQP, que es NONE y sí pierde mensajes
-        # si el consumidor muere. AUTO emite un basic.ack real.
+        # Conviene no confundir los modos de Spring con los de AMQP. El AcknowledgeMode.AUTO de
+        # Spring —que es el que sigue rigiendo en las DLQ— emite un basic.ack real al retornar el
+        # método; el auto-ack del protocolo AMQP es AcknowledgeMode.NONE y ese sí pierde mensajes
+        # si el consumidor muere.
 
-        # Fair dispatch. Con tres intentos y multiplicador 2 el hilo duerme hasta 6 s por mensaje;
-        # sin esto, un solo consumidor retendría la ventana por omisión de 250 mensajes sin
-        # confirmar.
+        # Fair dispatch, y determinismo de la demostración.
+        #
+        # Ya NO es porque el hilo duerma durante el backoff: con la cola de reintento las esperas
+        # viven en el broker y el hilo del consumidor queda libre en cuanto confirma. Es una
+        # ventaja del rediseño frente al reintento en proceso, donde el throughput se detenía
+        # durante los segundos de espera.
         prefetch: ${NOTIFY_PREFETCH:1}
 
-        # Red de seguridad: si algún día se desactivara el retry, un rechazo seguiría sin reencolar
-        # y acabaría en la DLQ en lugar de entrar en un bucle de reentrega.
+        # Gobierna el requeue que usa EL CONTENEDOR cuando él decide rechazar, lo que bajo
+        # ackMode MANUAL no ocurre nunca: el requeue lo pasamos nosotros como tercer argumento de
+        # basicNack. Queda inerte para los tres consumidores de trabajo.
+        #
+        # Se conserva por dos razones: sigue aplicando a los listeners que están en AUTO, y es la
+        # red de seguridad correcta si alguien quitara el ackMode de una anotación.
         default-requeue-rejected: false
 
-        retry:
-          enabled: true
-          max-attempts: ${NOTIFY_MAX_ATTEMPTS:3}
-          initial-interval: ${NOTIFY_BACKOFF_MS:1000}
-          max-interval: ${NOTIFY_BACKOFF_MAX_MS:10000}
-          multiplier: 2.0
+        # NO hay bloque retry, y esto es lo más importante de este archivo.
+        #
+        # El reintento ya no lo hace Spring Retry en proceso: lo hace el broker, con una cola de
+        # espera por flujo. Ver config/RabbitMQConfig.java y support/ReintentoPublisher.java.
+        #
+        # Dejar aquí el bloque, aunque fuera con enabled: false, sería una invitación a
+        # reactivarlo sin saber que ya hay otro mecanismo. Y los dos juntos no se suman, se
+        # corrompen: el RetryOperationsInterceptor envuelve el método del listener, así que sus
+        # intentos ocurren DENTRO de cada entrega del broker —3 por 4 son doce ejecuciones por
+        # mensaje—, la cabecera de intentos no avanzaría entre ellos, y al agotarlos el
+        # RejectAndDontRequeueRecoverer lanza AmqpRejectAndDontRequeueException, que atravesaría
+        # el catch del error permanente y haría que un fallo transitorio saliera clasificado como
+        # permanente.
 
   mail:
     host: ${MAIL_HOST:smtp.gmail.com}
@@ -51,20 +70,53 @@ spring:
       mail.smtp.auth: true
       mail.smtp.starttls.enable: true
 
+      # Los tres plazos del cliente SMTP. Sin declararlos, JavaMail usa -1, que es espera
+      # INDEFINIDA, y eso no es un ajuste fino: rompe el reintento entero.
+      #
+      # Un servidor de correo inalcanzable deja de ser un fallo transitorio y pasa a ser un hilo
+      # bloqueado. Como el consumidor de correo tiene prefetch 1 y una sola concurrencia, el
+      # bloqueo no afecta a un mensaje sino a la cola: q.cmd.email deja de avanzar, los mensajes
+      # se acumulan en estado listo, no se publica nada en la cola de espera, no llega nada a la
+      # DLQ y en el log no aparece ni un error. El único síntoma es una cola que crece, que es
+      # justo el fallo que más tarda en notarse.
+      #
+      # Se midió contra el entorno desplegado deteniendo el servidor de correo: el envío se quedó
+      # bloqueado veinte segundos y terminó CON ÉXITO al volver el servidor, confirmando en el
+      # primer intento un mensaje que debía haber recorrido los cuatro. La escalera de reintentos
+      # era inalcanzable precisamente en el fallo más probable que tiene este servicio.
+      #
+      # Hacen falta los tres y no solo el de conexión: connectiontimeout cubre el establecimiento
+      # del socket, timeout la lectura de la respuesta del servidor y writetimeout la escritura.
+      # Un servidor que acepta la conexión y luego calla se cuela por el segundo, y uno que deja
+      # de leer a mitad del cuerpo, por el tercero.
+      #
+      # Cinco segundos por intento, cuatro intentos y la escalera de esperas suman menos de medio
+      # minuto hasta la DLQ, que es un plazo razonable para una notificación.
+      mail.smtp.connectiontimeout: ${MAIL_TIMEOUT_MS:5000}
+      mail.smtp.timeout: ${MAIL_TIMEOUT_MS:5000}
+      mail.smtp.writetimeout: ${MAIL_TIMEOUT_MS:5000}
+
 andesstay:
   rabbitmq:
-    # Topología del caso: tres exchanges, seis colas y nueve bindings. Se declara en código, en
+    # Topología del caso: tres exchanges, nueve colas y nueve bindings. Se declara en código, en
     # config/RabbitMQConfig.java; estos valores son la única fuente de los nombres.
+    #
+    # Las colas pasaron de seis a nueve al introducir la espera del reintento. Los exchanges y los
+    # bindings NO cambian, porque a la cola de reintento se publica por el exchange por omisión,
+    # que mantiene un binding implícito a cada cola por su nombre y no hay que declarar nada.
     exchange:
       direct: cmd.direct
       topic: cmd.topic
       dlx: cmd.dead.dlx
     queues:
       email: q.cmd.email
+      email-retry: q.cmd.email.retry
       email-dlq: q.cmd.email.dlq
       housekeeping: q.cmd.housekeeping
+      housekeeping-retry: q.cmd.housekeeping.retry
       housekeeping-dlq: q.cmd.housekeeping.dlq
       voucher: q.cmd.voucher
+      voucher-retry: q.cmd.voucher.retry
       voucher-dlq: q.cmd.voucher.dlq
     routing:
       email-send: email.send
@@ -76,10 +128,31 @@ andesstay:
       voucher-gen: voucher.gen
       voucher-topic: "voucher.*"
       voucher-dead: voucher.dead
+
+    reintento:
+      # Escalera de esperas, una por reintento. TRES esperas significan CUATRO intentos.
+      #
+      # Se declara como lista literal y no con initial-interval más multiplicador porque así no
+      # hay que calcular nada: lo que se lee es lo que se espera. El valor anterior,
+      # max-attempts: 3 con multiplicador 2, producía tres intentos y DOS esperas (1 s y 2 s), así
+      # que el peldaño de 4 s que la documentación prometía no existía. Era aritméticamente
+      # imposible.
+      #
+      # Para la demostración se sube a 3000,6000,12000 con NOTIFY_BACKOFF_LADDER: la Management UI
+      # refresca cada 5 s por omisión, así que con 1-2-4 los tres saltos ocurren entre dos
+      # refrescos y en pantalla no se ve nada.
+      esperas-ms: ${NOTIFY_BACKOFF_LADDER:1000,2000,4000}
+
     retencion:
-      # Políticas de retención de la guía 2.2.3. Una notificación de hace más de cinco minutos ya
-      # no le sirve al huésped, así que expira y queda registrada en la DLQ en lugar de llegar
-      # tarde.
+      # Políticas de retención de la guía 2.2.3.
+      #
+      # OJO con el significado de este TTL cuando hay reintentos: x-message-ttl mide el tiempo que
+      # el mensaje lleva EN ESA COLA, no su edad. Cada retorno desde la cola de reintento es una
+      # llegada nueva a la cola de trabajo, así que el reloj arranca de cero y un mensaje puede
+      # acumular cuatro ventanas de cinco minutos —más de veinte minutos de vida— respetando cada
+      # residencia individual. No es un defecto del rediseño, el TTL nunca midió la edad, pero
+      # invalida la lectura de que «una notificación de hace más de cinco minutos ya no se envía».
+      # Hacer cumplir la edad de verdad exigiría comparar el timestamp del envelope.
       mensaje-ttl-ms: ${NOTIFY_MENSAJE_TTL_MS:300000}
       # Veinticuatro horas de histórico en la DLQ, para poder analizar el fallo.
       dlq-ttl-ms: ${NOTIFY_DLQ_TTL_MS:86400000}
@@ -99,8 +172,9 @@ management:
   endpoints:
     web:
       exposure:
-        # metrics es lo que habilita notify.messages.* y notify.dlq.rate, que es el ítem 6.9 del
-        # checklist.
+        # metrics es lo que habilita notify.messages.* y notify.dlq.rate. Sin ellas no hay
+        # forma de saber si el sistema está sano: la tasa de DLQ es el indicador de que algo
+        # cambió aguas arriba, y sin exponerla solo se descubre leyendo logs.
         include: health,info,metrics
   endpoint:
     health:
