@@ -69,7 +69,6 @@ spring:
     properties:
       mail.smtp.auth: true
       mail.smtp.starttls.enable: true
-
       # Los tres plazos del cliente SMTP. Sin declararlos, JavaMail usa -1, que es espera
       # INDEFINIDA, y eso no es un ajuste fino: rompe el reintento entero.
       #
@@ -95,6 +94,18 @@ spring:
       mail.smtp.connectiontimeout: ${MAIL_TIMEOUT_MS:5000}
       mail.smtp.timeout: ${MAIL_TIMEOUT_MS:5000}
       mail.smtp.writetimeout: ${MAIL_TIMEOUT_MS:5000}
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Firma (JWKS), vigencia, issuer y audience del JWT de Azure AD
+          issuer-uri: https://login.microsoftonline.com/${AZURE_TENANT_ID:055d11d1-8ae0-4221-a6f7-b50be0a623b4}/v2.0
+          jwk-set-uri: https://login.microsoftonline.com/${AZURE_TENANT_ID:055d11d1-8ae0-4221-a6f7-b50be0a623b4}/discovery/v2.0/keys
+          # Azure AD puede emitir aud como api://<clientId> o como el GUID del clientId
+          audiences:
+            - api://${AZURE_CLIENT_ID:704a544f-3d92-44f5-aef9-8559574cff34}
+            - ${AZURE_CLIENT_ID:704a544f-3d92-44f5-aef9-8559574cff34}
 
 andesstay:
   rabbitmq:
