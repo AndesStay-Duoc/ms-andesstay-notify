@@ -4,7 +4,9 @@ import cl.andesstay.notify.messaging.Envelope;
 import cl.andesstay.notify.messaging.EnvelopeReader;
 import cl.andesstay.notify.service.CorreoService;
 import cl.andesstay.notify.support.ProcesamientoIdempotente;
-import lombok.RequiredArgsConstructor;
+import cl.andesstay.notify.support.ReintentoPublisher;
+import com.rabbitmq.client.Channel;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.beans.factory.annotation.Value;
@@ -13,58 +15,66 @@ import org.springframework.stereotype.Component;
 import static cl.andesstay.notify.messaging.ErroresDeMensajeria.permanenteComoRechazo;
 
 /**
- * Consume la cola de correos (andesstay.rabbitmq.queues.email) y delega el envío en
- * {@link CorreoService}.
+ * Consume q.cmd.email y envía el correo al huésped.
  *
- * Este consumidor solo hace mensajería: lee el envelope, lo traduce a una solicitud, delega, y
- * deja que el contenedor confirme o rechace. La lógica del correo vive en el servicio.
+ * Gestiona su acknowledge de forma explícita: el ackMode MANUAL de la anotación hace que el
+ * contenedor no confirme ni rechace nada, y el canal llega como parámetro para que sea este
+ * consumidor quien emita el basicAck o el basicNack. Los cinco caminos están en
+ * {@link ConsumidorDeTrabajo}, que es la clase que los resuelve.
  *
- * Sobre el manejo de errores, que es el núcleo de la fase 6: este método NO captura las
- * excepciones. Antes lo hacía, y eso dejaba inerte la política de reintentos, porque el
- * RetryOperationsInterceptor de Spring solo actúa cuando el método del listener lanza. Al capturar
- * y hacer basicNack, el contenedor veía un método que terminó bien y el mensaje iba a la DLQ en el
- * primer fallo, sin reintentos.
+ * El ackMode va en la anotación y NO en el application.yml. Puesto en el YAML sería global y
+ * alcanzaría también a DeadLetterConsumer, que no confirma nada por su cuenta: las tres DLQ se
+ * llenarían de mensajes en estado unacked que se reencolarían al cerrar el canal.
  *
- * Tampoco se usa ya el modo de acknowledge manual. Con AcknowledgeMode.MANUAL el contenedor no
- * envía ack ni nack por su cuenta, así que una excepción dejaría el mensaje sin confirmar hasta el
- * cierre del canal y entonces se REENCOLARÍA en lugar de ir a la DLQ. Con el modo AUTO, que es el
- * que queda por omisión, el contenedor confirma al retornar sin error y rechaza al propagarse la
- * excepción; agotados los reintentos, ese rechazo es un basic.reject sin requeue y el mensaje viaja
- * a la DLQ de correos por el x-dead-letter-exchange de la cola.
+ * El envío lo hace {@link CorreoService}; este consumidor solo traduce el mensaje a una solicitud.
+ * Reparto de responsabilidades entre los dos tipos de error:
  *
- * El AUTO de Spring no es el auto-ack del protocolo AMQP, que es AcknowledgeMode.NONE y sí pierde
- * mensajes si el consumidor muere. El AUTO emite un basic.ack real después de que el método
- * retorna.
- *
- * Reparto de responsabilidades entre los dos tipos de error (ver ErroresDeMensajeria):
- *
- *   transitorio (servidor SMTP caído, timeout)  -> se propaga tal cual, se reintenta
- *   permanente  (destinatario o plantilla malos) -> AmqpRejectAndDontRequeueException, a la DLQ ya
+ *   transitorio (servidor SMTP caído, timeout)   -> se propaga tal cual, se reintenta
+ *   permanente  (destinatario o plantilla malos) -> SolicitudInvalidaException en el servicio, que
+ *                                                   permanenteComoRechazo convierte en
+ *                                                   AmqpRejectAndDontRequeueException: a la DLQ ya
  */
+@Slf4j
 @Component
-@RequiredArgsConstructor
-public class EmailConsumer {
+public class EmailConsumer extends ConsumidorDeTrabajo {
 
-    /** Nombre de la cola, para las métricas y el log: la misma propiedad que usa el listener. */
-    @Value("${andesstay.rabbitmq.queues.email}")
-    private String cola;
-
-    private final EnvelopeReader envelopeReader;
-    private final ProcesamientoIdempotente procesamiento;
     private final CorreoService correoService;
 
-    @RabbitListener(queues = "${andesstay.rabbitmq.queues.email}")
-    public void processEmail(Message message) {
-        Envelope envelope = envelopeReader.leer(message);
-        String traceId = envelope.traceIdODesconocido();
+    public EmailConsumer(
+            @Value("${andesstay.rabbitmq.queues.email}") String cola,
+            @Value("${andesstay.rabbitmq.queues.email-retry}") String colaDeEspera,
+            CorreoService correoService,
+            EnvelopeReader envelopeReader,
+            ProcesamientoIdempotente procesamiento,
+            ReintentoPublisher reintentos) {
+        // El nombre de la cola sale de la MISMA propiedad que el @RabbitListener de abajo, en
+        // lugar de una constante aparte: así la etiqueta de las métricas no puede desincronizarse
+        // de la cola que realmente se escucha.
+        super(cola, colaDeEspera, "Email", envelopeReader, procesamiento, reintentos);
+        this.correoService = correoService;
+    }
 
-        procesamiento.ejecutar(cola, envelope.eventId(), traceId,
-                permanenteComoRechazo(() -> correoService.enviar(aSolicitud(envelope), traceId)));
+    @RabbitListener(queues = "${andesstay.rabbitmq.queues.email}", ackMode = "MANUAL")
+    public void processEmail(Message message, Channel channel) {
+        resolver(message, channel);
     }
 
     /**
-     * Traduce el payload a la solicitud del servicio. Acepta los nombres del formato contratado
-     * (destinatario, plantilla, datos) y los del anterior (to, subject, body).
+     * Cualquier MailException sale del servicio sin tocarse: es el caso transitorio, y el
+     * catch(Exception) de la clase base lo clasifica en el camino 4 o en el 5 según el intento.
+     * Solo SolicitudInvalidaException se convierte en rechazo permanente (camino 3).
+     */
+    @Override
+    protected void procesar(Envelope envelope, String traceId) {
+        permanenteComoRechazo(() -> correoService.enviar(aSolicitud(envelope), traceId)).run();
+    }
+
+    /**
+     * Traduce el mensaje a la solicitud del servicio.
+     *
+     * El formato contratado trae {@code plantilla} y {@code datos}; el anterior traía
+     * {@code subject} y {@code body} ya armados. Se pasan los dos porque la publicación migra al
+     * formato nuevo en un despliegue posterior al de este servicio.
      */
     static CorreoService.Solicitud aSolicitud(Envelope envelope) {
         Object reservationId = envelope.valor("reservationId");

@@ -4,7 +4,9 @@ import cl.andesstay.notify.messaging.Envelope;
 import cl.andesstay.notify.messaging.EnvelopeReader;
 import cl.andesstay.notify.service.HousekeepingService;
 import cl.andesstay.notify.support.ProcesamientoIdempotente;
-import lombok.RequiredArgsConstructor;
+import cl.andesstay.notify.support.ReintentoPublisher;
+import com.rabbitmq.client.Channel;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.beans.factory.annotation.Value;
@@ -13,32 +15,39 @@ import org.springframework.stereotype.Component;
 import static cl.andesstay.notify.messaging.ErroresDeMensajeria.permanenteComoRechazo;
 
 /**
- * Consume la cola de housekeeping (andesstay.rabbitmq.queues.housekeeping) y delega la emisión del
- * ticket en {@link HousekeepingService}.
+ * Consume q.cmd.housekeeping y emite el ticket de preparación o de limpieza de la unidad.
  *
- * Solo hace mensajería. Sobre el manejo de errores y el modo de acknowledge, ver la explicación en
- * {@link EmailConsumer}: el método no captura excepciones, para que la política de reintentos tenga
- * efecto, y el modo AUTO es el que convierte un fallo agotado en un viaje a la DLQ.
+ * Es el mensaje que resuelve el problema de que housekeeping se enteraba tarde.
+ *
+ * Gestiona su acknowledge de forma explícita, igual que {@link EmailConsumer}: ackMode MANUAL en la
+ * anotación y el canal como parámetro. Los cinco caminos están en {@link ConsumidorDeTrabajo}.
  */
+@Slf4j
 @Component
-@RequiredArgsConstructor
-public class HousekeepingConsumer {
+public class HousekeepingConsumer extends ConsumidorDeTrabajo {
 
-    /** Nombre de la cola, para las métricas y el log: la misma propiedad que usa el listener. */
-    @Value("${andesstay.rabbitmq.queues.housekeeping}")
-    private String cola;
-
-    private final EnvelopeReader envelopeReader;
-    private final ProcesamientoIdempotente procesamiento;
     private final HousekeepingService housekeepingService;
 
-    @RabbitListener(queues = "${andesstay.rabbitmq.queues.housekeeping}")
-    public void processHousekeeping(Message message) {
-        Envelope envelope = envelopeReader.leer(message);
-        String traceId = envelope.traceIdODesconocido();
+    public HousekeepingConsumer(
+            @Value("${andesstay.rabbitmq.queues.housekeeping}") String cola,
+            @Value("${andesstay.rabbitmq.queues.housekeeping-retry}") String colaDeEspera,
+            HousekeepingService housekeepingService,
+            EnvelopeReader envelopeReader,
+            ProcesamientoIdempotente procesamiento,
+            ReintentoPublisher reintentos) {
+        super(cola, colaDeEspera, "Housekeeping", envelopeReader, procesamiento, reintentos);
+        this.housekeepingService = housekeepingService;
+    }
 
-        procesamiento.ejecutar(cola, envelope.eventId(), traceId,
-                permanenteComoRechazo(() -> housekeepingService.emitir(aTicket(envelope), traceId)));
+    @RabbitListener(queues = "${andesstay.rabbitmq.queues.housekeeping}", ackMode = "MANUAL")
+    public void processHousekeeping(Message message, Channel channel) {
+        resolver(message, channel);
+    }
+
+    /** Las validaciones y el ticket viven en HousekeepingService; un dato faltante es permanente. */
+    @Override
+    protected void procesar(Envelope envelope, String traceId) {
+        permanenteComoRechazo(() -> housekeepingService.emitir(aTicket(envelope), traceId)).run();
     }
 
     /** El formato contratado usa tipoTarea/fechaRequerida; el anterior usaba action/date. */

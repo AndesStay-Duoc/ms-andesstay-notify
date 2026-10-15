@@ -71,7 +71,7 @@ class SeguridadWebTest {
         mvc.perform(get(ESTADO).with(conRol("Admin")))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.servicio").value("ms-andesstay-notify"))
-                .andExpect(jsonPath("$.colas['q.cmd.email']").value("no existe en el broker"));
+                .andExpect(jsonPath("$.flujos.email.trabajo['q.cmd.email']").value("no existe en el broker"));
     }
 
     // ── /actuator/metrics ────────────────────────────────────────────────────
