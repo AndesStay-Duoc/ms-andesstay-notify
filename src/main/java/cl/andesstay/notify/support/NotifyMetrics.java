@@ -4,8 +4,6 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.retry.RetryContext;
-import org.springframework.retry.support.RetrySynchronizationManager;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
@@ -68,25 +66,32 @@ public class NotifyMetrics {
     }
 
     /**
-     * Cuenta la invocación como reintento si el interceptor de Spring Retry ya la había intentado
-     * antes.
+     * Cuenta la invocación como reintento cuando no es el primer intento del mensaje.
      *
-     * El reintento de Spring es en proceso y sin reentrega del broker, así que no se puede detectar
-     * con {@code messageProperties.isRedelivered()}: la entrega es la misma. El contexto de retry,
-     * en cambio, está disponible en el hilo mientras el interceptor está activo y lleva la cuenta
-     * de intentos.
+     * EL INTENTO LLEGA COMO PARÁMETRO, y no es cosmética. Antes se leía del RetryContext que
+     * Spring Retry pone en el hilo, y ese mecanismo ya no existe: el reintento lo hace el broker
+     * con la cola de espera, no un interceptor en proceso.
+     * RetrySynchronizationManager.getContext() devolvería siempre null, la condición nunca se
+     * cumpliría y notify.messages.retried se quedaría clavado en CERO para siempre, sin que
+     * nada más fallara. Es la peor clase de defecto: el servicio funciona, el log dice que hubo
+     * reintentos y la métrica que los cuenta miente.
+     *
+     * El valor viene de la cabecera x-andesstay-intentos, que escribe ReintentoPublisher. No se
+     * puede sacar de messageProperties.isRedelivered(): esa bandera indica una reentrega del
+     * broker sobre la MISMA cola, y aquí el mensaje llega como una entrega nueva desde la cola
+     * de espera, con redelivered en false.
      */
-    public void registrarIntento(String cola) {
-        RetryContext contexto = RetrySynchronizationManager.getContext();
-        if (contexto != null && contexto.getRetryCount() > 0) {
-            reintentos.computeIfAbsent(cola, c -> Counter
-                            .builder("notify.messages.retried")
-                            .description("Reintentos de procesamiento")
-                            .tag("queue", c)
-                            .register(registry))
-                    .increment();
-            log.debug("[Métricas] cola={} intento={}", cola, contexto.getRetryCount() + 1);
+    public void registrarIntento(String cola, int intento) {
+        if (intento <= 1) {
+            return;
         }
+        reintentos.computeIfAbsent(cola, c -> Counter
+                        .builder("notify.messages.retried")
+                        .description("Reintentos de procesamiento")
+                        .tag("queue", c)
+                        .register(registry))
+                .increment();
+        log.debug("[Métricas] cola={} intento={}", cola, intento);
     }
 
     public double tasaDlq() {

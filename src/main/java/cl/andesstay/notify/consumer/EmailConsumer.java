@@ -4,9 +4,10 @@ import cl.andesstay.notify.email.EmailTemplates;
 import cl.andesstay.notify.messaging.Envelope;
 import cl.andesstay.notify.messaging.EnvelopeReader;
 import cl.andesstay.notify.support.ProcesamientoIdempotente;
+import cl.andesstay.notify.support.ReintentoPublisher;
+import com.rabbitmq.client.Channel;
 import jakarta.mail.internet.AddressException;
 import jakarta.mail.internet.InternetAddress;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
@@ -19,67 +20,70 @@ import org.springframework.stereotype.Component;
 /**
  * Consume q.cmd.email y envía el correo al huésped.
  *
- * Sobre el manejo de errores, que es el núcleo de la fase 6: este método NO captura las
- * excepciones. Antes lo hacía, y eso dejaba inerte la política de reintentos, porque el
- * RetryOperationsInterceptor de Spring solo actúa cuando el método del listener lanza. Al capturar
- * y hacer basicNack, el contenedor veía un método que terminó bien y el mensaje iba a la DLQ en el
- * primer fallo, sin reintentos.
+ * Gestiona su acknowledge de forma explícita: el ackMode MANUAL de la anotación hace que el
+ * contenedor no confirme ni rechace nada, y el canal llega como parámetro para que sea este
+ * consumidor quien emita el basicAck o el basicNack. Los cinco caminos están en
+ * {@link ConsumidorDeTrabajo}, que es la clase que los resuelve.
  *
- * Tampoco se usa ya el modo de acknowledge manual. Con AcknowledgeMode.MANUAL el contenedor no
- * envía ack ni nack por su cuenta, así que una excepción dejaría el mensaje sin confirmar hasta el
- * cierre del canal y entonces se REENCOLARÍA en lugar de ir a la DLQ. Con el modo AUTO, que es el
- * que queda por omisión, el contenedor confirma al retornar sin error y rechaza al propagarse la
- * excepción; agotados los reintentos, ese rechazo es un basic.reject sin requeue y el mensaje viaja
- * a q.cmd.email.dlq por el x-dead-letter-exchange de la cola.
- *
- * El AUTO de Spring no es el auto-ack del protocolo AMQP, que es AcknowledgeMode.NONE y sí pierde
- * mensajes si el consumidor muere. El AUTO emite un basic.ack real después de que el método
- * retorna.
+ * El ackMode va en la anotación y NO en el application.yml. Puesto en el YAML sería global y
+ * alcanzaría también a DeadLetterConsumer, que no confirma nada por su cuenta: las tres DLQ se
+ * llenarían de mensajes en estado unacked que se reencolarían al cerrar el canal.
  *
  * Reparto de responsabilidades entre los dos tipos de error:
  *
- *   transitorio (servidor SMTP caído, timeout)  -> se propaga tal cual, se reintenta
+ *   transitorio (servidor SMTP caído, timeout)   -> se propaga tal cual, se reintenta
  *   permanente  (destinatario o plantilla malos) -> AmqpRejectAndDontRequeueException, a la DLQ ya
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
-public class EmailConsumer {
-
-    private static final String COLA = "q.cmd.email";
+public class EmailConsumer extends ConsumidorDeTrabajo {
 
     private final JavaMailSender mailSender;
-    private final EnvelopeReader envelopeReader;
     private final EmailTemplates templates;
-    private final ProcesamientoIdempotente procesamiento;
+    private final String fromAddress;
 
-    @Value("${andesstay.mail.from}")
-    private String fromAddress;
+    public EmailConsumer(
+            @Value("${andesstay.rabbitmq.queues.email}") String cola,
+            @Value("${andesstay.rabbitmq.queues.email-retry}") String colaDeEspera,
+            @Value("${andesstay.mail.from}") String fromAddress,
+            JavaMailSender mailSender,
+            EmailTemplates templates,
+            EnvelopeReader envelopeReader,
+            ProcesamientoIdempotente procesamiento,
+            ReintentoPublisher reintentos) {
+        // El nombre de la cola sale de la MISMA propiedad que el @RabbitListener de abajo, en
+        // lugar de una constante aparte: así la etiqueta de las métricas no puede desincronizarse
+        // de la cola que realmente se escucha.
+        super(cola, colaDeEspera, "Email", envelopeReader, procesamiento, reintentos);
+        this.mailSender = mailSender;
+        this.templates = templates;
+        this.fromAddress = fromAddress;
+    }
 
-    @RabbitListener(queues = "${andesstay.rabbitmq.queues.email}")
-    public void processEmail(Message message) {
-        Envelope envelope = envelopeReader.leer(message);
-        String traceId = envelope.traceIdODesconocido();
+    @RabbitListener(queues = "${andesstay.rabbitmq.queues.email}", ackMode = "MANUAL")
+    public void processEmail(Message message, Channel channel) {
+        resolver(message, channel);
+    }
 
-        procesamiento.ejecutar(COLA, envelope.eventId(), traceId, () -> {
-            String destinatario = direccionValida(envelope);
-            EmailTemplates.Correo correo = construir(envelope);
+    @Override
+    protected void procesar(Envelope envelope, String traceId) {
+        String destinatario = direccionValida(envelope);
+        EmailTemplates.Correo correo = construir(envelope);
 
-            log.info("[Email] Enviando a={} asunto='{}' traceId={}",
-                    destinatario, correo.asunto(), traceId);
+        log.info("[Email] Enviando a={} asunto='{}' traceId={}",
+                destinatario, correo.asunto(), traceId);
 
-            SimpleMailMessage mail = new SimpleMailMessage();
-            mail.setFrom(fromAddress);
-            mail.setTo(destinatario);
-            mail.setSubject(correo.asunto());
-            mail.setText(correo.cuerpo());
+        SimpleMailMessage mail = new SimpleMailMessage();
+        mail.setFrom(fromAddress);
+        mail.setTo(destinatario);
+        mail.setSubject(correo.asunto());
+        mail.setText(correo.cuerpo());
 
-            // Cualquier MailException sale de aquí sin tocarse: es el caso transitorio y lo tiene
-            // que ver el interceptor de reintentos.
-            mailSender.send(mail);
+        // Cualquier MailException sale de aquí sin tocarse: es el caso transitorio, y el
+        // catch(Exception) de la clase base lo clasifica en el camino 4 o en el 5 según el intento.
+        mailSender.send(mail);
 
-            log.info("[Email] Enviado correctamente traceId={}", traceId);
-        });
+        log.info("[Email] Enviado correctamente traceId={}", traceId);
     }
 
     /**

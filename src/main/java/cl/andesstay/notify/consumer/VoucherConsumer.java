@@ -3,44 +3,47 @@ package cl.andesstay.notify.consumer;
 import cl.andesstay.notify.messaging.Envelope;
 import cl.andesstay.notify.messaging.EnvelopeReader;
 import cl.andesstay.notify.support.ProcesamientoIdempotente;
-import lombok.RequiredArgsConstructor;
+import cl.andesstay.notify.support.ReintentoPublisher;
+import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.Set;
 
 /**
- * Consume q.cmd.voucher y genera el comprobante de la reserva.
+ * Consume q.cmd.voucher y genera el documento de la reserva.
  *
- * Es el mensaje que resuelve el problema de que el huésped no recibía comprobante formal.
+ * Es el mensaje que resuelve el problema de que el huésped no recibía un voucher formal.
  *
- * Sobre el manejo de errores y el modo de acknowledge, ver la explicación en
- * {@link EmailConsumer}.
+ * Gestiona su acknowledge de forma explícita, igual que {@link EmailConsumer}: ackMode MANUAL en la
+ * anotación y el canal como parámetro. Los cinco caminos están en {@link ConsumidorDeTrabajo}.
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
-public class VoucherConsumer {
-
-    private static final String COLA = "q.cmd.voucher";
+public class VoucherConsumer extends ConsumidorDeTrabajo {
 
     private static final Set<String> DOCUMENTOS = Set.of("VOUCHER", "BOLETA");
 
-    private final EnvelopeReader envelopeReader;
-    private final ProcesamientoIdempotente procesamiento;
-
-    @RabbitListener(queues = "${andesstay.rabbitmq.queues.voucher}")
-    public void processVoucher(Message message) {
-        Envelope envelope = envelopeReader.leer(message);
-        String traceId = envelope.traceIdODesconocido();
-
-        procesamiento.ejecutar(COLA, envelope.eventId(), traceId, () -> generar(envelope, traceId));
+    public VoucherConsumer(
+            @Value("${andesstay.rabbitmq.queues.voucher}") String cola,
+            @Value("${andesstay.rabbitmq.queues.voucher-retry}") String colaDeEspera,
+            EnvelopeReader envelopeReader,
+            ProcesamientoIdempotente procesamiento,
+            ReintentoPublisher reintentos) {
+        super(cola, colaDeEspera, "Voucher", envelopeReader, procesamiento, reintentos);
     }
 
-    private void generar(Envelope envelope, String traceId) {
+    @RabbitListener(queues = "${andesstay.rabbitmq.queues.voucher}", ackMode = "MANUAL")
+    public void processVoucher(Message message, Channel channel) {
+        resolver(message, channel);
+    }
+
+    @Override
+    protected void procesar(Envelope envelope, String traceId) {
         Object reservationId = envelope.valor("reservationId");
         // El formato contratado usa destinatario/tipoDocumento; el anterior usaba guestEmail y no
         // traía tipo de documento, de ahí el VOUCHER por omisión.
