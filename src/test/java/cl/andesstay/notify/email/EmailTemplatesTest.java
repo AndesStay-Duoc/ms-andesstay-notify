@@ -4,7 +4,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.springframework.amqp.AmqpRejectAndDontRequeueException;
+import cl.andesstay.notify.service.SolicitudInvalidaException;
 
 import java.util.Map;
 
@@ -57,8 +57,8 @@ class EmailTemplatesTest {
     @Test
     @DisplayName("una plantilla inexistente es error permanente")
     void plantillaInexistenteEsPermanente() {
-        AmqpRejectAndDontRequeueException e = assertThrows(
-                AmqpRejectAndDontRequeueException.class,
+        SolicitudInvalidaException e = assertThrows(
+                SolicitudInvalidaException.class,
                 () -> templates.render("PLANTILLA_QUE_NO_EXISTE", "R-1", DATOS));
 
         assertTrue(e.getMessage().contains("plantilla desconocida"), e.getMessage());
@@ -67,7 +67,7 @@ class EmailTemplatesTest {
     @Test
     @DisplayName("una plantilla nula es error permanente")
     void plantillaNulaEsPermanente() {
-        assertThrows(AmqpRejectAndDontRequeueException.class,
+        assertThrows(SolicitudInvalidaException.class,
                 () -> templates.render(null, "R-1", DATOS));
     }
 

@@ -1,21 +1,18 @@
 package cl.andesstay.notify.consumer;
 
-import cl.andesstay.notify.email.EmailTemplates;
 import cl.andesstay.notify.messaging.Envelope;
 import cl.andesstay.notify.messaging.EnvelopeReader;
+import cl.andesstay.notify.service.CorreoService;
 import cl.andesstay.notify.support.ProcesamientoIdempotente;
 import cl.andesstay.notify.support.ReintentoPublisher;
 import com.rabbitmq.client.Channel;
-import jakarta.mail.internet.AddressException;
-import jakarta.mail.internet.InternetAddress;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.mail.SimpleMailMessage;
-import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.stereotype.Component;
+
+import static cl.andesstay.notify.messaging.ErroresDeMensajeria.permanenteComoRechazo;
 
 /**
  * Consume q.cmd.email y envía el correo al huésped.
@@ -29,25 +26,24 @@ import org.springframework.stereotype.Component;
  * alcanzaría también a DeadLetterConsumer, que no confirma nada por su cuenta: las tres DLQ se
  * llenarían de mensajes en estado unacked que se reencolarían al cerrar el canal.
  *
+ * El envío lo hace {@link CorreoService}; este consumidor solo traduce el mensaje a una solicitud.
  * Reparto de responsabilidades entre los dos tipos de error:
  *
  *   transitorio (servidor SMTP caído, timeout)   -> se propaga tal cual, se reintenta
- *   permanente  (destinatario o plantilla malos) -> AmqpRejectAndDontRequeueException, a la DLQ ya
+ *   permanente  (destinatario o plantilla malos) -> SolicitudInvalidaException en el servicio, que
+ *                                                   permanenteComoRechazo convierte en
+ *                                                   AmqpRejectAndDontRequeueException: a la DLQ ya
  */
 @Slf4j
 @Component
 public class EmailConsumer extends ConsumidorDeTrabajo {
 
-    private final JavaMailSender mailSender;
-    private final EmailTemplates templates;
-    private final String fromAddress;
+    private final CorreoService correoService;
 
     public EmailConsumer(
             @Value("${andesstay.rabbitmq.queues.email}") String cola,
             @Value("${andesstay.rabbitmq.queues.email-retry}") String colaDeEspera,
-            @Value("${andesstay.mail.from}") String fromAddress,
-            JavaMailSender mailSender,
-            EmailTemplates templates,
+            CorreoService correoService,
             EnvelopeReader envelopeReader,
             ProcesamientoIdempotente procesamiento,
             ReintentoPublisher reintentos) {
@@ -55,9 +51,7 @@ public class EmailConsumer extends ConsumidorDeTrabajo {
         // lugar de una constante aparte: así la etiqueta de las métricas no puede desincronizarse
         // de la cola que realmente se escucha.
         super(cola, colaDeEspera, "Email", envelopeReader, procesamiento, reintentos);
-        this.mailSender = mailSender;
-        this.templates = templates;
-        this.fromAddress = fromAddress;
+        this.correoService = correoService;
     }
 
     @RabbitListener(queues = "${andesstay.rabbitmq.queues.email}", ackMode = "MANUAL")
@@ -65,67 +59,31 @@ public class EmailConsumer extends ConsumidorDeTrabajo {
         resolver(message, channel);
     }
 
+    /**
+     * Cualquier MailException sale del servicio sin tocarse: es el caso transitorio, y el
+     * catch(Exception) de la clase base lo clasifica en el camino 4 o en el 5 según el intento.
+     * Solo SolicitudInvalidaException se convierte en rechazo permanente (camino 3).
+     */
     @Override
     protected void procesar(Envelope envelope, String traceId) {
-        String destinatario = direccionValida(envelope);
-        EmailTemplates.Correo correo = construir(envelope);
-
-        log.info("[Email] Enviando a={} asunto='{}' traceId={}",
-                destinatario, correo.asunto(), traceId);
-
-        SimpleMailMessage mail = new SimpleMailMessage();
-        mail.setFrom(fromAddress);
-        mail.setTo(destinatario);
-        mail.setSubject(correo.asunto());
-        mail.setText(correo.cuerpo());
-
-        // Cualquier MailException sale de aquí sin tocarse: es el caso transitorio, y el
-        // catch(Exception) de la clase base lo clasifica en el camino 4 o en el 5 según el intento.
-        mailSender.send(mail);
-
-        log.info("[Email] Enviado correctamente traceId={}", traceId);
+        permanenteComoRechazo(() -> correoService.enviar(aSolicitud(envelope), traceId)).run();
     }
 
     /**
-     * Resuelve el cuerpo del correo.
+     * Traduce el mensaje a la solicitud del servicio.
      *
      * El formato contratado trae {@code plantilla} y {@code datos}; el anterior traía
-     * {@code subject} y {@code body} ya armados. Se aceptan los dos porque la publicación migra al
+     * {@code subject} y {@code body} ya armados. Se pasan los dos porque la publicación migra al
      * formato nuevo en un despliegue posterior al de este servicio.
      */
-    private EmailTemplates.Correo construir(Envelope envelope) {
-        String plantilla = envelope.texto("plantilla");
-        if (plantilla != null) {
-            Object reservationId = envelope.valor("reservationId");
-            return templates.render(plantilla,
-                    reservationId == null ? null : reservationId.toString(),
-                    envelope.datos());
-        }
-
-        String asunto = envelope.texto("subject", "asunto");
-        String cuerpo = envelope.texto("body", "cuerpo");
-        if (asunto == null || cuerpo == null) {
-            throw new AmqpRejectAndDontRequeueException(
-                    "el payload no trae ni plantilla ni asunto/cuerpo: " + envelope.payload());
-        }
-        return new EmailTemplates.Correo(asunto, cuerpo);
-    }
-
-    /**
-     * Un destinatario ausente o mal formado no se arregla reintentando, así que se clasifica como
-     * permanente antes de molestar al servidor de correo.
-     */
-    private String direccionValida(Envelope envelope) {
-        String destinatario = envelope.texto("destinatario", "to");
-        if (destinatario == null) {
-            throw new AmqpRejectAndDontRequeueException("el payload no trae destinatario");
-        }
-        try {
-            new InternetAddress(destinatario).validate();
-        } catch (AddressException e) {
-            throw new AmqpRejectAndDontRequeueException(
-                    "destinatario inválido '" + destinatario + "': " + e.getMessage());
-        }
-        return destinatario;
+    static CorreoService.Solicitud aSolicitud(Envelope envelope) {
+        Object reservationId = envelope.valor("reservationId");
+        return new CorreoService.Solicitud(
+                envelope.texto("destinatario", "to"),
+                envelope.texto("plantilla"),
+                reservationId == null ? null : reservationId.toString(),
+                envelope.datos(),
+                envelope.texto("subject", "asunto"),
+                envelope.texto("body", "cuerpo"));
     }
 }

@@ -2,17 +2,17 @@ package cl.andesstay.notify.consumer;
 
 import cl.andesstay.notify.messaging.Envelope;
 import cl.andesstay.notify.messaging.EnvelopeReader;
+import cl.andesstay.notify.service.VoucherService;
 import cl.andesstay.notify.support.ProcesamientoIdempotente;
 import cl.andesstay.notify.support.ReintentoPublisher;
 import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
-import java.util.Set;
+import static cl.andesstay.notify.messaging.ErroresDeMensajeria.permanenteComoRechazo;
 
 /**
  * Consume q.cmd.voucher y genera el documento de la reserva.
@@ -26,15 +26,17 @@ import java.util.Set;
 @Component
 public class VoucherConsumer extends ConsumidorDeTrabajo {
 
-    private static final Set<String> DOCUMENTOS = Set.of("VOUCHER", "BOLETA");
+    private final VoucherService voucherService;
 
     public VoucherConsumer(
             @Value("${andesstay.rabbitmq.queues.voucher}") String cola,
             @Value("${andesstay.rabbitmq.queues.voucher-retry}") String colaDeEspera,
+            VoucherService voucherService,
             EnvelopeReader envelopeReader,
             ProcesamientoIdempotente procesamiento,
             ReintentoPublisher reintentos) {
         super(cola, colaDeEspera, "Voucher", envelopeReader, procesamiento, reintentos);
+        this.voucherService = voucherService;
     }
 
     @RabbitListener(queues = "${andesstay.rabbitmq.queues.voucher}", ackMode = "MANUAL")
@@ -42,31 +44,21 @@ public class VoucherConsumer extends ConsumidorDeTrabajo {
         resolver(message, channel);
     }
 
+    /** Las validaciones y la generación viven en VoucherService; un dato faltante es permanente. */
     @Override
     protected void procesar(Envelope envelope, String traceId) {
-        Object reservationId = envelope.valor("reservationId");
-        // El formato contratado usa destinatario/tipoDocumento; el anterior usaba guestEmail y no
-        // traía tipo de documento, de ahí el VOUCHER por omisión.
-        String destinatario = envelope.texto("destinatario", "guestEmail");
-        String tipoDocumento = envelope.texto("tipoDocumento");
-        if (tipoDocumento == null) {
-            tipoDocumento = "VOUCHER";
-        }
+        permanenteComoRechazo(() -> voucherService.generar(aSolicitud(envelope), traceId)).run();
+    }
 
-        if (reservationId == null) {
-            throw new AmqpRejectAndDontRequeueException("el payload no trae reservationId");
-        }
-        if (destinatario == null) {
-            throw new AmqpRejectAndDontRequeueException("el payload no trae destinatario");
-        }
-        if (!DOCUMENTOS.contains(tipoDocumento)) {
-            throw new AmqpRejectAndDontRequeueException(
-                    "tipoDocumento desconocido: " + tipoDocumento + " (conocidos: " + DOCUMENTOS + ")");
-        }
-
-        // TODO: generar el PDF con iText o JasperReports y adjuntarlo al correo. Hasta entonces el
-        // documento queda registrado con sus datos, que es lo que consume la evidencia de la fase 6.
-        log.info("[Voucher] {} generado reserva={} destinatario={} datos={} traceId={}",
-                tipoDocumento, reservationId, destinatario, envelope.datos(), traceId);
+    /**
+     * El formato contratado usa destinatario/tipoDocumento; el anterior usaba guestEmail y no
+     * traía tipo de documento, de ahí el VOUCHER por omisión que aplica el servicio.
+     */
+    static VoucherService.Solicitud aSolicitud(Envelope envelope) {
+        return new VoucherService.Solicitud(
+                envelope.valor("reservationId"),
+                envelope.texto("destinatario", "guestEmail"),
+                envelope.texto("tipoDocumento"),
+                envelope.datos());
     }
 }

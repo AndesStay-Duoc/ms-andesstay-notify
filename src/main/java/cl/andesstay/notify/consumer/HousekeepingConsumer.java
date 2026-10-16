@@ -2,17 +2,17 @@ package cl.andesstay.notify.consumer;
 
 import cl.andesstay.notify.messaging.Envelope;
 import cl.andesstay.notify.messaging.EnvelopeReader;
+import cl.andesstay.notify.service.HousekeepingService;
 import cl.andesstay.notify.support.ProcesamientoIdempotente;
 import cl.andesstay.notify.support.ReintentoPublisher;
 import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
-import java.util.Set;
+import static cl.andesstay.notify.messaging.ErroresDeMensajeria.permanenteComoRechazo;
 
 /**
  * Consume q.cmd.housekeeping y emite el ticket de preparación o de limpieza de la unidad.
@@ -26,16 +26,17 @@ import java.util.Set;
 @Component
 public class HousekeepingConsumer extends ConsumidorDeTrabajo {
 
-    /** PREPARACION al pasar a CHECKIN_PENDIENTE, LIMPIEZA al pasar a CHECKOUT. */
-    private static final Set<String> TAREAS = Set.of("PREPARACION", "LIMPIEZA", "PREPARE", "CLEAN");
+    private final HousekeepingService housekeepingService;
 
     public HousekeepingConsumer(
             @Value("${andesstay.rabbitmq.queues.housekeeping}") String cola,
             @Value("${andesstay.rabbitmq.queues.housekeeping-retry}") String colaDeEspera,
+            HousekeepingService housekeepingService,
             EnvelopeReader envelopeReader,
             ProcesamientoIdempotente procesamiento,
             ReintentoPublisher reintentos) {
         super(cola, colaDeEspera, "Housekeeping", envelopeReader, procesamiento, reintentos);
+        this.housekeepingService = housekeepingService;
     }
 
     @RabbitListener(queues = "${andesstay.rabbitmq.queues.housekeeping}", ackMode = "MANUAL")
@@ -43,29 +44,21 @@ public class HousekeepingConsumer extends ConsumidorDeTrabajo {
         resolver(message, channel);
     }
 
+    /** Las validaciones y el ticket viven en HousekeepingService; un dato faltante es permanente. */
     @Override
     protected void procesar(Envelope envelope, String traceId) {
-        // El formato contratado usa tipoTarea/fechaRequerida; el anterior usaba action/date.
-        String tipoTarea = envelope.texto("tipoTarea", "action");
-        String fecha = envelope.texto("fechaRequerida", "date");
-        Object unitId = envelope.valor("unitId");
-        Object reservationId = envelope.valor("reservationId");
-        String unidad = envelope.texto("unidad");
-        String prioridad = envelope.texto("prioridad");
-        String notas = envelope.texto("notas");
+        permanenteComoRechazo(() -> housekeepingService.emitir(aTicket(envelope), traceId)).run();
+    }
 
-        if (tipoTarea == null || !TAREAS.contains(tipoTarea)) {
-            throw new AmqpRejectAndDontRequeueException(
-                    "tipoTarea desconocido: " + tipoTarea + " (conocidos: " + TAREAS + ")");
-        }
-        if (unitId == null) {
-            throw new AmqpRejectAndDontRequeueException("el payload no trae unitId");
-        }
-
-        // TODO: integrar con el sistema de tickets del hostal o enviar push al equipo. Hasta
-        // entonces el ticket queda en el log con todos sus datos, que es lo que consume la
-        // evidencia de la fase 6.
-        log.info("[Housekeeping] TICKET {} → unitId={} unidad={} reserva={} fecha={} prioridad={} notas={} traceId={}",
-                tipoTarea, unitId, unidad, reservationId, fecha, prioridad, notas, traceId);
+    /** El formato contratado usa tipoTarea/fechaRequerida; el anterior usaba action/date. */
+    static HousekeepingService.Ticket aTicket(Envelope envelope) {
+        return new HousekeepingService.Ticket(
+                envelope.texto("tipoTarea", "action"),
+                envelope.texto("fechaRequerida", "date"),
+                envelope.valor("unitId"),
+                envelope.valor("reservationId"),
+                envelope.texto("unidad"),
+                envelope.texto("prioridad"),
+                envelope.texto("notas"));
     }
 }
