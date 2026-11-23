@@ -74,6 +74,22 @@ class SeguridadWebTest {
                 .andExpect(jsonPath("$.flujos.email.trabajo['q.cmd.email']").value("no existe en el broker"));
     }
 
+    @Test
+    void elEstadoConservaTodasSusClaves() throws Exception {
+        // Red de seguridad del paso de la lectura de colas a EstadoDeColasService: el contrato del
+        // endpoint no cambia. Pasa igual antes y después del refactor.
+        var respuesta = mvc.perform(get(ESTADO).with(conRol("Admin"))).andExpect(status().isOk());
+        for (String clave : new String[]{"servicio", "timestamp", "flujos", "tasaDlq", "eventIdEnRegistro"}) {
+            respuesta.andExpect(jsonPath("$." + clave).exists());
+        }
+        for (String flujo : new String[]{"email", "housekeeping", "voucher"}) {
+            for (String papel : new String[]{"trabajo", "espera", "cuarentena"}) {
+                respuesta.andExpect(jsonPath("$.flujos." + flujo + "." + papel).isMap());
+            }
+        }
+        respuesta.andExpect(jsonPath("$.flujos.voucher.cuarentena['q.cmd.voucher.dlq']").exists());
+    }
+
     // ── /actuator/metrics ────────────────────────────────────────────────────
 
     @Test
